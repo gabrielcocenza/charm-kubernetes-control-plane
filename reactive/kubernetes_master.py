@@ -856,7 +856,9 @@ def set_final_status():
         # All services should be up and running at this point. Double-check...
         failing_services = master_services_down()
         if len(failing_services) != 0:
-            msg = "Stopped services: {}".format(",".join(failing_services))
+            msg = "Stopped or bad configured services: {}".format(
+                ",".join(failing_services)
+            )
             hookenv.status_set("blocked", msg)
             return
     else:
@@ -955,9 +957,8 @@ def add_systemd_file_limit():
             f.write("LimitNOFILE=65535")
 
 
-def add_systemd_restart_always():
+def get_systemd_always_restart_template():
     template = "templates/service-always-restart.systemd-latest.conf"
-
     try:
         # Get the systemd version
         cmd = ["systemd", "--version"]
@@ -970,16 +971,39 @@ def add_systemd_restart_always():
         # Check for old version (for xenial support)
         if systemd_version < 230:
             template = "templates/service-always-restart.systemd-229.conf"
+        return template
     except Exception:
         traceback.print_exc()
         hookenv.log(
-            "Failed to detect systemd version, using latest template", level="ERROR"
+            "Failed to detect systemd version, using latest template",
+            level="ERROR",
         )
+        return template
 
+
+def add_systemd_restart_always():
+    hookenv.log("Adding systemd_restart_always files")
+    template = get_systemd_always_restart_template()
     for service in master_services:
         dest_dir = "/etc/systemd/system/snap.{}.daemon.service.d".format(service)
         os.makedirs(dest_dir, exist_ok=True)
         copyfile(template, "{}/always-restart.conf".format(dest_dir))
+
+
+def remove_systemd_restart_always():
+    hookenv.log("Removing systemd_restart_always files to start Pacemaker")
+    template = get_systemd_always_restart_template().split("/")[1]
+    for service in master_services:
+        file_name = "/etc/systemd/system/snap.{}.daemon.service.d/" "{}".format(
+            service, template
+        )
+        try:
+            os.remove(file_name)
+        except OSError:
+            hookenv.log(
+                "Failed to remove always-restart.conf from service: {}".format(service),
+                level=hookenv.WARNING,
+            )
 
 
 def add_systemd_file_watcher():
@@ -1198,7 +1222,9 @@ def start_master():
     handle_etcd_relation(etcd)
 
     # Set up additional systemd services
-    add_systemd_restart_always()
+    # restarting services should be with pacemaker/corosync if hacluster is present
+    if not is_flag_set("ha.connected"):
+        add_systemd_restart_always()
     add_systemd_file_limit()
     add_systemd_file_watcher()
     add_systemd_iptables_patch()
@@ -3229,8 +3255,16 @@ def haconfig_changed():
 @when("ha.connected", "kubernetes-master.components.started")
 @when_not("hacluster-configured")
 def configure_hacluster():
+    remove_systemd_restart_always()
+    check_call(["systemctl", "daemon-reload"])
+
+    # let pacemaker restart the service if fails to start
+    check_call(["crm", "configure", "property", "start-failure-is-fatal=false"])
+
     for service in master_services:
         daemon = "snap.{}.daemon".format(service)
+        # NOTE: services should not be configured to start at boot time in the cluster
+        service_pause(daemon)
         add_service_to_hacluster(service, daemon)
 
     # get a new cert
@@ -3252,6 +3286,8 @@ def remove_hacluster():
     for service in master_services:
         daemon = "snap.{}.daemon".format(service)
         remove_service_from_hacluster(service, daemon)
+        # enable services at boot time again once outside the cluster
+        service_resume(daemon)
 
     # get a new cert
     if is_flag_set("certificates.available"):
@@ -3261,6 +3297,9 @@ def remove_hacluster():
         send_api_urls()
     if is_flag_set("kube-api-endpoint.available"):
         push_service_data()
+
+    add_systemd_restart_always()
+    check_call(["systemctl", "daemon-reload"])
 
     clear_flag("hacluster-configured")
 

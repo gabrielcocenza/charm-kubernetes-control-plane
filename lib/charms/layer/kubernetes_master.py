@@ -452,18 +452,44 @@ def get_snap_revs(snaps):
 
 
 def check_service(service, attempts=6, delay=10):
-    """Check if a given service is up, giving it a bit of time to come up if needed.
+    """Check if a given service is enabled/disabled depending on hacluster and
+    if it's up and running, giving it a bit of time to come up if needed.
 
-    Returns True if the service is running, False if not, or raises a ValueError if
-    the service is unknown. Will automatically handle translating master component
-    names (e.g., kube-apiserver) to service names (snap.kube-apiserver.daemon).
+    Returns True if the service is running and configured as expected, False if not.
+    Will automatically handle translating master component name (e.g., kube-apiserver)
+    to service names (snap.kube-apiserver.daemon).
     """
-    for pattern in ("{}", "snap.{}", "snap.{}.daemon", "snap.kube-{}.daemon"):
-        if host.service("is-enabled", pattern.format(service)):
-            service = pattern.format(service)
-            break
+    service_full_name = "snap.{}.daemon".format(service)
+    ha_connected = is_flag_set("ha.connected")
+    cmd = ["systemctl", "is-enabled", service_full_name]
+    try:
+        state = check_output(cmd).decode("utf-8").strip()
+    except CalledProcessError as err:
+        state = err.output.decode("utf-8").strip()
+
+    if (state == "enabled" and not ha_connected) or (
+        state == "disabled" and ha_connected
+    ):
+        return check_service_running(service_full_name, attempts, delay)
+
+    if state == "enabled" and ha_connected:
+        msg = "Service: {} should be disabled because of hacluster".format(service)
+        return False
+
+    if state == "disabled" and not ha_connected:
+        msg = "Service: {} should be enabled in the absence of hacluster".format(
+            service
+        )
+
     else:
-        raise ValueError("Unknown service: {}".format(service))
+        msg = "Unknown service: {}".format(service)
+
+    hookenv.status_set("blocked", msg)
+    hookenv.log(msg, "ERROR")
+    return False
+
+
+def check_service_running(service, attempts=6, delay=10):
     # Give each service up to a minute to become active; this is especially
     # needed now that controller-mgr/scheduler/proxy need the apiserver
     # to validate their token against a k8s secret.

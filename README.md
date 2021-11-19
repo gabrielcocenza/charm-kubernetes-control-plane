@@ -39,7 +39,7 @@ For details on configuring and operating this charm, see the [kubernetes-master 
 ## Building the charm
 
 ```
-make charm
+charm build --force --debug
 ```
 
 ## Testing the charm
