@@ -460,23 +460,22 @@ def check_service(service, attempts=6, delay=10):
     to service names (snap.kube-apiserver.daemon).
     """
     service_full_name = "snap.{}.daemon".format(service)
-    ha_connected = is_flag_set("ha.connected")
+    ha_configured = is_flag_set("hacluster-configured")
     cmd = ["systemctl", "is-enabled", service_full_name]
     try:
         state = check_output(cmd).decode("utf-8").strip()
     except CalledProcessError as err:
         state = err.output.decode("utf-8").strip()
 
-    if (state == "enabled" and not ha_connected) or (
-        state == "disabled" and ha_connected
+    if (state == "enabled" and not ha_configured) or (
+        state == "disabled" and ha_configured
     ):
         return check_service_running(service_full_name, attempts, delay)
 
-    if state == "enabled" and ha_connected:
+    if state == "enabled" and ha_configured:
         msg = "Service: {} should be disabled because of hacluster".format(service)
-        return False
 
-    if state == "disabled" and not ha_connected:
+    if state == "disabled" and not ha_configured:
         msg = "Service: {} should be enabled in the absence of hacluster".format(
             service
         )

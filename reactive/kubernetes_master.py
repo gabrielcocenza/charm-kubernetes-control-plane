@@ -957,8 +957,9 @@ def add_systemd_file_limit():
             f.write("LimitNOFILE=65535")
 
 
-def get_systemd_always_restart_template():
+def add_systemd_restart_always():
     template = "templates/service-always-restart.systemd-latest.conf"
+
     try:
         # Get the systemd version
         cmd = ["systemd", "--version"]
@@ -971,19 +972,12 @@ def get_systemd_always_restart_template():
         # Check for old version (for xenial support)
         if systemd_version < 230:
             template = "templates/service-always-restart.systemd-229.conf"
-        return template
     except Exception:
         traceback.print_exc()
         hookenv.log(
-            "Failed to detect systemd version, using latest template",
-            level="ERROR",
+            "Failed to detect systemd version, using latest template", level="ERROR"
         )
-        return template
 
-
-def add_systemd_restart_always():
-    hookenv.log("Adding systemd_restart_always files")
-    template = get_systemd_always_restart_template()
     for service in master_services:
         dest_dir = "/etc/systemd/system/snap.{}.daemon.service.d".format(service)
         os.makedirs(dest_dir, exist_ok=True)
@@ -992,10 +986,10 @@ def add_systemd_restart_always():
 
 def remove_systemd_restart_always():
     hookenv.log("Removing systemd_restart_always files to start Pacemaker")
-    template = get_systemd_always_restart_template().split("/")[1]
+    file = "always-restart.conf"
     for service in master_services:
-        file_name = "/etc/systemd/system/snap.{}.daemon.service.d/" "{}".format(
-            service, template
+        file_name = "/etc/systemd/system/snap.{}.daemon.service.d/{}".format(
+            service, file
         )
         try:
             os.remove(file_name)
@@ -1185,6 +1179,7 @@ def setup_auth_webhook_tokens():
     "tls_client.certs.changed",
     "tls_client.ca.written",
     "upgrade.series.in-progress",
+    "ha.configuration.in-progress"
 )
 def start_master():
     """Run the Kubernetes master components."""
@@ -1223,8 +1218,8 @@ def start_master():
 
     # Set up additional systemd services
     # restarting services should be with pacemaker/corosync if hacluster is present
-    if not is_flag_set("ha.connected"):
-        add_systemd_restart_always()
+    # if not is_flag_set("kubernetes-master.components.to_cluster"):
+    add_systemd_restart_always()
     add_systemd_file_limit()
     add_systemd_file_watcher()
     add_systemd_iptables_patch()
@@ -3254,35 +3249,95 @@ def haconfig_changed():
 
 @when("ha.connected", "kubernetes-master.components.started")
 @when_not("hacluster-configured")
+def check_resources_ready_to_hacluster():
+    kube_masters = endpoint_from_flag('kube-masters.connected')
+    # just pass to pacemaker after services are stable 
+    failing_services = master_services_down()
+    if len(failing_services) != 0:
+        kube_masters.set_master_services('services_ready', False)
+        return
+    else:
+        kube_masters.set_master_services('services_ready', True)
+
+    if kube_masters.check_cluster_master_services('services_ready'):
+        hookenv.log("Master services are stable and ready to cluster")
+        set_flag("ha.configuration.in-progress")
+
+
+@when(
+    "ha.connected",
+    "ha.configuration.in-progress",
+)
+@when_not("hacluster-configured")
 def configure_hacluster():
-    remove_systemd_restart_always()
-    check_call(["systemctl", "daemon-reload"])
-
-    # let pacemaker restart the service if fails to start
-    check_call(["crm", "configure", "property", "start-failure-is-fatal=false"])
-
+    kube_masters = endpoint_from_flag('kube-masters.connected')
+    hacluster = endpoint_from_flag('ha.connected')
+    # remove_systemd_restart_always()
+    # check_call(["systemctl", "daemon-reload"])
     for service in master_services:
         daemon = "snap.{}.daemon".format(service)
         # NOTE: services should not be configured to start at boot time in the cluster
         service_pause(daemon)
-        add_service_to_hacluster(service, daemon)
+    kube_masters.set_master_services('services_paused_to_cluster', True)
 
-    # get a new cert
-    if is_flag_set("certificates.available"):
-        send_data()
+    if kube_masters.check_cluster_master_services('services_paused_to_cluster'):
+        hookenv.log("Master services paused to cluster")
 
-    # update workers
-    if is_flag_set("kube-control.connected"):
-        send_api_urls()
-    if is_flag_set("kube-api-endpoint.available"):
-        push_service_data()
+        # let pacemaker restart the service if fails to start
+        check_call(["crm", "-w", "-F", "configure", "property", "start-failure-is-fatal=false"])
 
-    set_flag("hacluster-configured")
+        for service in master_services:
+            daemon = "snap.{}.daemon".format(service)
+            add_service_to_hacluster(service, daemon)
+
+        # controller manager depends on apiserver
+        hacluster.add_colocation(
+            "api_with_clone",
+            "inf",
+            ["res_kube_apiserver_snap.kube_apiserver.daemon", "cl_res_kube_apiserver_snap.kube_apiserver.daemon"]
+        )
+
+        import relations.hacluster.interface_hacluster.common as hacluster_common #noqa
+        crm = hacluster_common.CRM()
+        crm.order(
+            "clone-then-api",
+            "Mandatory",
+            "cl_res_kube_apiserver_snap.kube_apiserver.daemon",
+            "res_kube_apiserver_snap.kube_apiserver.daemon",
+        )
+        crm.order(
+            "manager-after-api",
+            "Mandatory",
+            "res_kube_apiserver_snap.kube_apiserver.daemon",
+            "res_kube_controller_manager_snap.kube_controller_manager.daemon",
+        )
+        hacluster.manage_resources(crm)
+        # hacluster.bind_resources()
+
+        hookenv.log("Master services clustered")
+
+        # get a new cert
+        if is_flag_set("certificates.available"):
+            send_data()
+
+        # update workers
+        if is_flag_set("kube-control.connected"):
+            send_api_urls()
+        if is_flag_set("kube-api-endpoint.available"):
+            push_service_data()
+
+        # start_master()
+        set_flag("hacluster-configured")
+        clear_flag("ha.configuration.in-progress")
 
 
 @when_not("ha.connected")
 @when("hacluster-configured")
 def remove_hacluster():
+    kube_masters = endpoint_from_flag('kube-masters.connected')
+    kube_masters.set_master_services('services_ready', None)
+    kube_masters.set_master_services('services_paused_to_cluster', None)
+
     for service in master_services:
         daemon = "snap.{}.daemon".format(service)
         remove_service_from_hacluster(service, daemon)
@@ -3298,7 +3353,7 @@ def remove_hacluster():
     if is_flag_set("kube-api-endpoint.available"):
         push_service_data()
 
-    add_systemd_restart_always()
+    # add_systemd_restart_always()
     check_call(["systemctl", "daemon-reload"])
 
     clear_flag("hacluster-configured")
